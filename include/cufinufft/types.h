@@ -26,9 +26,16 @@ struct cuda_complex_impl<double> {
 template <typename T>
 using cuda_complex = typename cuda_complex_impl<T>::type;
 
+template <typename T>
+struct type_3_params {
+    T X1, C1, D1, h1, gam1; // x dim: X=halfwid C=center D=freqcen h,gam=rescale
+    T X2, C2, D2, h2, gam2; // y
+    T X3, C3, D3, h3, gam3; // z
+};
 
 template <typename T>
 struct cufinufft_plan_t {
+
     cufinufft_opts opts;
     finufft_spread_opts spopts;
 
@@ -71,10 +78,18 @@ struct cufinufft_plan_t {
     int *numnupts;
     int *subprob_to_nupts;
 
+    // type 3 specific
+    T *S, *T, *U;                     // pointers to user's target NU pts arrays (no new allocs)
+    cuda_complex<T> *prephase;        // pre-phase, for all input NU pts
+    cuda_complex<T> *deconv;          // reciprocal of kernel FT, phase, all output NU pts
+    cuda_complex<T> *CpBatch;         // working array of prephased strengths
+    T *Sp, *Tp, *Up;                  // internal primed targs (s'_k, etc), allocated
+    type_3_params<T> t3P;             // groups together type 3 shift, scale, phase, parameters
+    cufinufft_plan_t<T> *innerT2plan; // ptr used for type 2 in step 2 of type 3
+
     cufftHandle fftplan;
     cudaStream_t *streams;
 };
-
 
 template <typename T>
 static cufftType_t cufft_type();
@@ -96,4 +111,4 @@ static inline cufftResult cufft_ex(cufftHandle plan, cufftDoubleComplex *idata, 
     return cufftExecZ2Z(plan, idata, odata, direction);
 }
 
-#endif
+#endif // CUFINUFFT_TYPES_H

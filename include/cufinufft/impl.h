@@ -18,6 +18,8 @@ template <typename T>
 int cufinufft1d1_exec(cuda_complex<T> *d_c, cuda_complex<T> *d_fk, cufinufft_plan_t<T> *d_plan);
 template <typename T>
 int cufinufft1d2_exec(cuda_complex<T> *d_c, cuda_complex<T> *d_fk, cufinufft_plan_t<T> *d_plan);
+template <typename T>
+int cufinufft1d3_exec(cuda_complex<T> *d_c, cuda_complex<T> *d_fk, cufinufft_plan_t<T> *d_plan);
 
 // 2d
 template <typename T>
@@ -65,8 +67,8 @@ static void cufinufft_setup_binsize(int type, int dim, cufinufft_opts *opts) {
 }
 
 template <typename T>
-int cufinufft_makeplan_impl(int type, int dim, int *nmodes, int iflag, int ntransf, T tol,
-                            cufinufft_plan_t<T> **d_plan_ptr, cufinufft_opts *opts) {
+int cufinufft_makeplan_impl_type12(int type, int dim, int *nmodes, int iflag, int ntransf, T tol,
+                                   cufinufft_plan_t<T> **d_plan_ptr, cufinufft_opts *opts) {
     /*
         "plan" stage (in single or double precision).
             See ../docs/cppdoc.md for main user-facing documentation.
@@ -77,8 +79,7 @@ int cufinufft_makeplan_impl(int type, int dim, int *nmodes, int iflag, int ntran
             (0) creating a new plan struct (d_plan), a pointer to which is passed
                 back by writing that pointer into *d_plan_ptr.
             (1) set up the spread option, d_plan.spopts.
-            (2) calculate the correction factor on cpu, copy the value from cpu to
-                gpu
+            (2) calculate the correction factor on cpu, copy the value from cpu to gpu
             (3) allocate gpu arrays with size determined by number of fourier modes
                 and method related options that had been set in d_plan.opts
             (4) call cufftPlanMany and save the cufft plan inside cufinufft plan
@@ -222,7 +223,111 @@ int cufinufft_makeplan_impl(int type, int dim, int *nmodes, int iflag, int ntran
 }
 
 template <typename T>
-int cufinufft_setpts_impl(int M, T *d_kx, T *d_ky, T *d_kz, int N, T *d_s, T *d_t, T *d_u, cufinufft_plan_t<T> *d_plan)
+int cufinufft_makeplan_impl_type3(int type, int dim, int *nmodes, int iflag, int ntransf, T tol,
+                                  cufinufft_plan_t<T> **d_plan_ptr, cufinufft_opts *opts) {
+    /*
+        "plan" stage (in single or double precision).
+            See ../docs/cppdoc.md for main user-facing documentation.
+            Note that *d_plan_ptr in the args list was called simply *plan there.
+            This is the remaining dev-facing doc:
+
+    This performs:
+            (0) creating a new plan struct (d_plan), a pointer to which is passed
+                back by writing that pointer into *d_plan_ptr.
+            (1) set up the spread option, d_plan.spopts.
+            (2) calculate the correction factor on cpu, copy the value from cpu to
+                gpu
+            (3) allocate gpu arrays with size determined by number of fourier modes
+                and method related options that had been set in d_plan.opts
+            (4) call cufftPlanMany and save the cufft plan inside cufinufft plan
+            Variables and arrays inside the plan struct are set and allocated.
+
+        Melody Shih 07/25/19. Use-facing moved to markdown, Barnett 2/16/21.
+    */
+    // Mult-GPU support: set the CUDA Device ID:
+
+    int orig_gpu_device_id;
+    cudaGetDevice(&orig_gpu_device_id);
+
+    if (opts == NULL) {
+        // options might not be supplied to this function => assume device 0 by default
+        cudaSetDevice(0);
+    } else {
+        cudaSetDevice(opts->gpu_device_id);
+    }
+
+    /* allocate the plan structure, assign address to user pointer. */
+    cufinufft_plan_t<T> *d_plan = new cufinufft_plan_t<T>;
+    *d_plan_ptr = d_plan;
+    memset(d_plan, 0, sizeof(*d_plan)); // Zero out your struct, (sets all pointers to NULL)
+
+    /* If a user has not supplied their own options, assign defaults for them. */
+    if (opts == NULL) { // use default opts
+        cufinufft_default_opts(&(d_plan->opts));
+    } else {                  // or read from what's passed in
+        d_plan->opts = *opts; // keep a deep copy; changing *opts now has no effect
+    }
+
+    // #########################################################################################
+
+    using namespace cufinufft::common;
+    using namespace cufinufft::memtransfer;
+
+    d_plan->type = type;
+    d_plan->dim = dim;
+    d_plan->ntransf = ntransf;
+    d_plan->iflag = (iflag >= 0) ? 1 : -1;
+
+    int maxbatchsize = opts ? opts->gpu_maxbatchsize : 0;
+
+    if (maxbatchsize == 0)                   // implies: use a heuristic.
+        maxbatchsize = std::min(ntransf, 8); // heuristic from test codes
+    // MM: Does this hold for type 3 ?
+
+    d_plan->maxbatchsize = maxbatchsize;
+
+    /* Automatically set GPU method. */
+    if (d_plan->opts.gpu_method == 0)
+        d_plan->opts.gpu_method = 1; // MM: Is this the one to choose?
+
+    /* Setup Spreader */
+
+    int ier = setup_spreader_for_nufft(d_plan->spopts, tol, d_plan->opts); // MM: What does this do?
+
+    if (ier > 1) {
+        cudaSetDevice(orig_gpu_device_id);
+        return ier; // proceed if success or warning
+    }
+
+    d_plan->CpBatch = NULL;
+    d_plan->fwBatch = NULL;
+    d_plan->Sp = NULL; p->Tp = NULL; p->Up = NULL;
+    d_plan->prephase = NULL;
+    d_plan->deconv = NULL;
+    d_plan->innerT2plan = NULL;
+
+    cudaSetDevice(orig_gpu_device_id);
+
+    return ier;
+}
+
+template <typename T>
+int cufinufft_makeplan_impl(int type, int dim, int *nmodes, int iflag, int ntransf, T tol,
+                            cufinufft_plan_t<T> **d_plan_ptr, cufinufft_opts *opts) {
+    if (type == 1 || type == 2) {
+        return cufinufft_makeplan_impl_type12<T>(type, dim, nmodes, iflag, ntransf, tol, d_plan_ptr, opts);
+    } else if (type == 3) {
+        return cufinufft_makeplan_impl_type3<T>(type, dim, nmodes, iflag, ntransf, tol, d_plan_ptr, opts);
+    } else {
+        std::cerr << "Error: type must be 1, 2 or 3\n";
+        return 1;
+    }
+}
+
+// ###################################################################################################################
+
+template <typename T>
+int cufinufft_setpts_impl_type12(int M, T *d_kx, T *d_ky, T *d_kz, int N, T *d_s, T *d_t, T *d_u, cufinufft_plan_t<T> *d_plan)
 /*
     "setNUpts" stage (in single or double precision).
 
@@ -293,6 +398,7 @@ Notes: the type T means either single or double, matching the
         d_plan->kz = d_kz;
 
     using namespace cufinufft::spreadinterp;
+
     switch (d_plan->dim) {
     case 1: {
         if (d_plan->opts.gpu_method == 1) {
@@ -383,6 +489,103 @@ Notes: the type T means either single or double, matching the
     cudaSetDevice(orig_gpu_device_id);
 
     return 0;
+}
+
+template <typename T>
+void set_nhg_type3(
+    T S, T X, finufft_spread_opts spopts,
+	CUFINUFFT_BIGINT *nf, T *h, T *gam)
+{
+    const T upsampfac = 2.0; // MM: No other option for cuFINUFFT
+
+    int nss = spopts.nspread + 1;      // since ns may be odd
+    T Xsafe=X, Ssafe=S;              // may be tweaked locally
+    if (X==0.0)                        // logic ensures XS>=1, handle X=0 a/o S=0
+    if (S==0.0) {
+        Xsafe=1.0;
+        Ssafe=1.0;
+    } else Xsafe = max(Xsafe, 1/S);
+    else
+    Ssafe = max(Ssafe, 1/X);
+    // use the safe X and S...
+
+    T nfd = 2.0*upsampfac*Ssafe*Xsafe/PI + nss;
+
+    if (!isfinite(nfd))
+    nfd=0.0;                // use FLT to catch inf
+    *nf = (CUFINUFFT_BIGINT)nfd;
+    //printf("initial nf=%lld, ns=%d\n",*nf,spopts.nspread);
+    // catch too small nf, and nan or +-inf, otherwise spread fails...
+
+    if (*nf<2*spopts.nspread)
+    *nf=2*spopts.nspread;
+
+    if (*nf<MAX_NF)                             // otherwise will fail anyway
+    *nf = next235even(*nf);                   // expensive at huge nf
+    *h = 2*PI / *nf;                            // upsampled grid spacing
+    *gam = (FLT)*nf / (2.0*upsampfac*Ssafe);  // x scale fac to x'
+}
+
+template <typename T>
+int cufinufft_setpts_impl_type3(int M, T *d_kx, T *d_ky, T *d_kz, int N, T *d_s, T *d_t, T *d_u, cufinufft_plan_t<T> *d_plan)
+{
+    
+    // Mult-GPU support: set the CUDA Device ID:
+    int orig_gpu_device_id;
+    cudaGetDevice(&orig_gpu_device_id);
+    cudaSetDevice(d_plan->opts.gpu_device_id);
+
+    int dim = d_plan->dim;
+    d_plan->M = M; // number of nonuniform points
+
+    if dim > 1 {
+        printf("error: CUDA type 3 not implemented for dim > 1");
+        cudaSetDevice(orig_gpu_device_id);
+        return 1;
+    }
+
+    d_plan->S = d_s;
+    d_plan->T = d_t; // used for type 3; dim > 1 ?
+    d_plan->U = d_u; // used for type 3; dim > 2 ?
+
+    T S1, S2, S3;
+
+    arraywidcen(M, d_kx, &(d_plan->t3P.X1), &(d_plan->t3P.C1));
+    arraywidcen(nk, s, &S1, &(p->t3P.D1));
+
+    set_nhg_type3(
+        S1, d_plan->t3P.X1, d_plan->spopts,
+        &(d_plan->nf1), &(d_plan->t3P.h1), &(d_plan->t3P.gam1)
+    );
+
+    d_plan->t3P.C2 = 0.0;
+    d_plan->t3P.D2 = 0.0;
+
+    d_plan->nf = d_plan->nf1 * d_plan->nf2 * d_plan->nf3; // fine grid total number of points
+    
+    if (d_plan->nf * d_plan->batchSize > MAX_NF) {
+      printf("cufinufft type 3 setpts error: fwBatch would be bigger than MAX_NF, not attempting malloc!\n");
+      return 1;
+    }
+
+    // NONTRIVIAL PART OF TYPE 3
+
+    // Multi-GPU support: reset the device ID
+    cudaSetDevice(orig_gpu_device_id);
+
+    return 0;
+}
+
+template <typename T>
+int cufinufft_setpts_impl(int M, T *d_kx, T *d_ky, T *d_kz, int N, T *d_s, T *d_t, T *d_u, cufinufft_plan_t<T> *d_plan){
+    if (d_plan->type == 1 || d_plan->type == 2) {
+        return cufinufft_setpts_impl_type12<T>(M, d_kx, d_ky, d_kz, N, d_s, d_t, d_u, d_plan);
+    } else if (d_plan->type == 3) {
+        return cufinufft_setpts_impl_type3<T>(M, d_kx, d_ky, d_kz, N, d_s, d_t, d_u, d_plan);
+    } else {
+        std::cerr << "Error: type must be 1, 2 or 3\n";
+        return 1;
+    }
 }
 
 template <typename T>

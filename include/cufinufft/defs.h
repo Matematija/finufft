@@ -24,6 +24,8 @@ constexpr int32_t MAX_NF = std::numeric_limits<int32_t>::max();
 #define HORNER_WRONG_BETA 8
 #define ERR_NDATA_NOTVALID 9
 
+#define ARRAYWIDCEN_GROWFRAC 0.1
+
 // allow compile-time switch off of openmp, so compilation without any openmp
 // is done (Note: _OPENMP is automatically set by -fopenmp compile flag)
 #ifdef _OPENMP

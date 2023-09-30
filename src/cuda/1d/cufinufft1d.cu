@@ -120,3 +120,7 @@ template int cufinufft1d2_exec<float>(cuda_complex<float> *d_c, cuda_complex<flo
                                       cufinufft_plan_t<float> *d_plan);
 template int cufinufft1d2_exec<double>(cuda_complex<double> *d_c, cuda_complex<double> *d_fk,
                                        cufinufft_plan_t<double> *d_plan);
+// template int cufinufft1d3_exec<float>(cuda_complex<float> *d_c, cuda_complex<float> *d_fk,
+//                                       cufinufft_plan_t<float> *d_plan);
+// template int cufinufft1d3_exec<double>(cuda_complex<double> *d_c, cuda_complex<double> *d_fk,
+//                                        cufinufft_plan_t<double> *d_plan);

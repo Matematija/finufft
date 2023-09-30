@@ -174,7 +174,189 @@ int run_test(int method, int type, int N1, int M, T tol, T checktol, int iflag) 
     return std::isnan(rel_error) || rel_error > checktol;
 }
 
+template <typename T>
+int run_test_type3(int method, int type, int N, int M, T tol, T checktol, int iflag) {
+
+    // M = # of nonuniform points
+    // N = # of frequency targets
+
+    if (type != 3) {
+        std::cerr << "Invalid type " << type << " supplied\n";
+        return 1;
+    }
+
+    std::cout << std::scientific << std::setprecision(3);
+    int ier;
+
+    std::default_random_engine eng(1);
+    std::uniform_real_distribution<T> dist11(-1, 1);
+    auto randm11 = [&eng, &dist11]() { return dist11(eng); };
+
+    thrust::host_vector<T> x(M);
+    thrust::host_vector<T> s(N);
+    thrust::host_vector<thrust::complex<T>> c(M);
+    thrust::host_vector<thrust::complex<T>> fk(N);
+
+    // Making data
+    for (int i = 0; i < M; i++) {
+        x[i] = M_PI * randm11(); // x in [-pi,pi)
+        s[i] = M_PI * randm11(); // k in [-pi,pi)
+    }
+
+    for (int i = 0; i < M; i++) {
+        c[i].real(randm11());
+        c[i].imag(randm11());
+    }
+
+    thrust::device_vector<T> d_x{x};
+    thrust::device_vector<T> d_s{s};
+    thrust::device_vector<thrust::complex<T>> d_c{c};
+    thrust::device_vector<thrust::complex<T>> d_fk{fk};
+
+    // ###########################################################################################################################
+
+    cudaEvent_t start, stop;
+    float milliseconds = 0;
+    float totaltime = 0;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // warm up CUFFT (is slow, takes around 0.2 sec... )
+    cudaEventRecord(start);
+
+    {
+        int nf1 = 1;
+        cufftHandle fftplan;
+        cufftPlan1d(&fftplan, nf1, cufft_type<T>(), 1);
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("[time  ] dummy warmup call to CUFFT\t %.3g s\n", milliseconds / 1000);
+
+    // ###########################################################################################################################
+    // TO DO list:
+    // 1. cufinufft_makeplan_impl
+    // 2. cufinufft_setpts_impl
+    // 3. cufinufft_execute_impl
+    // 4. cufinufft_destroy_impl (??)
+    // ###########################################################################################################################
+
+    // now to the test...
+    cufinufft_plan_t<T> *dplan;
+    const int dim = 1;
+
+    // Here we setup our own opts, for gpu_method.
+    cufinufft_opts opts;
+    cufinufft_default_opts(&opts);
+
+    opts.gpu_method = method;
+    opts.gpu_maxbatchsize = 1;
+
+    int nmodes[3] = {N, 1, 1};
+    int ntransf = 1;
+    cudaEventRecord(start);
+
+    ier = cufinufft_makeplan_impl<T>(type, dim, nmodes, iflag, ntransf, tol, &dplan, &opts);
+
+    if (ier != 0) {
+        printf("err: cufinufft1d_plan\n");
+        return ier;
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    totaltime += milliseconds;
+
+    printf("[time  ] cufinufft plan:\t\t %.3g s\n", milliseconds / 1000);
+
+    // ###################################################
+
+    cudaEventRecord(start);
+
+    ier = cufinufft_setpts_impl<T>(M, d_x.data().get(), NULL, NULL, 0, NULL, NULL, NULL, dplan);
+
+    if (ier != 0) {
+        printf("err: cufinufft_setpts\n");
+        return ier;
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    totaltime += milliseconds;
+
+    printf("[time  ] cufinufft setNUpts:\t\t %.3g s\n", milliseconds / 1000);
+
+    // ###################################################
+
+    cudaEventRecord(start);
+
+    ier = cufinufft_execute_impl<T>((cuda_complex<T> *)d_c.data().get(), (cuda_complex<T> *)d_fk.data().get(), dplan);
+
+    if (ier != 0) {
+        printf("err: cufinufft1d_exec\n");
+        return ier;
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    totaltime += milliseconds;
+    float exec_ms = milliseconds;
+
+    printf("[time  ] cufinufft exec:\t\t %.3g s\n", milliseconds / 1000);
+
+    // ###################################################
+
+    cudaEventRecord(start);
+
+    ier = cufinufft_destroy_impl<T>(dplan);
+
+    if (ier != 0) {
+        printf("err %d: cufinufft1d_destroy\n", ier);
+        return ier;
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    totaltime += milliseconds;
+
+    printf("[time  ] cufinufft destroy:\t\t %.3g s\n", milliseconds / 1000);
+
+    // ###################################################
+
+    printf("[Method %d] %d U pts to %d NU pts in %.3g s:      %.3g NU pts/s\n", opts.gpu_method, N1, M,
+           totaltime / 1000, M / totaltime * 1000);
+    printf("\t\t\t\t\t(exec-only thoughput: %.3g NU pts/s)\n", M / exec_ms * 1000);
+
+    // ###################################################
+
+    T rel_error = std::numeric_limits<T>::max();
+
+    fk = d_fk;
+    c = d_c;
+
+    int it = 0.37 * N1; // choose some mode index to check
+    T s1 = s[it];       // choose some mode to check
+
+    thrust::complex<T> Ft = thrust::complex<T>(0, 0);
+    thrust::complex<T> J = thrust::complex<T>(0.0, iflag);
+
+    for (int j = 0; j < M; ++j)
+        Ft += c[j] * exp(J * s1 * x[j]); // crude direct
+
+    rel_error = abs(Ft - fk[it]) / infnorm(N1, (std::complex<T> *)fk.data());
+    printf("[gpu   ] one targ: rel err in c[%d] is %.3g\n", jt, rel_error);
+
+    return std::isnan(rel_error) || rel_error > checktol;
+}
+
 int main(int argc, char *argv[]) {
+
     if (argc != 8) {
         fprintf(stderr, "Usage: cufinufft1d_test method type N1 M tol checktol prec\n"
                         "Arguments:\n"
@@ -188,6 +370,7 @@ int main(int argc, char *argv[]) {
                         "  precision: f or d\n");
         return 1;
     }
+
     const int method = atoi(argv[1]);
     const int type = atoi(argv[2]);
     const int N1 = atof(argv[3]);
@@ -196,6 +379,7 @@ int main(int argc, char *argv[]) {
     const double checktol = atof(argv[6]);
     const int iflag = 1;
     const char prec = argv[7][0];
+
     if (prec == 'f')
         return run_test<float>(method, type, N1, M, tol, checktol, iflag);
     else if (prec == 'd')
